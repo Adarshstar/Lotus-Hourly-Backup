@@ -193,7 +193,7 @@ jobs:
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${OWNER_REPO}/actions/workflows/hourly-backup.yml/dispatches" \
-            -d '{"ref":"master"}' \
+            -d '{"ref":"main"}' \
             && echo "retriggered via workflow_dispatch" \
             || curl -fsS -X POST \
               -H "Authorization: Bearer ${GH_TOKEN}" \
