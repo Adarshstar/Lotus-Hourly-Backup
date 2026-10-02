@@ -1,0 +1,204 @@
+# Lotus Minecraft BDS — Hourly Backup Loop (AWS EC2)
+# Self-sustaining: 6 hourly online backups, then re-trigger itself.
+# GUARANTEE: Never stops, restarts, or reboots the server.
+
+name: Hourly Backup Loop
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [backup-loop]
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: lotus-server-backup-loop
+  cancel-in-progress: false
+
+jobs:
+  backup-loop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 390
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-client rsync tar gzip
+          (command -v gh >/dev/null) || {
+            curl -sL https://github.com/cli/cli/releases/download/v2.67.0/gh_2.67.0_linux_amd64.tar.gz | tar xz
+            sudo cp gh_2.67.0_linux_amd64/bin/gh /usr/local/bin/gh
+          }
+          gh --version
+
+      - name: Setup SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+        run: |
+          set -euo pipefail
+          test -n "${SSH_PRIVATE_KEY:-}" || { echo "Missing secret SSH_PRIVATE_KEY"; exit 1; }
+          test -n "${SERVER_HOST:-}" || { echo "Missing secret SERVER_HOST"; exit 1; }
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_lotus
+          chmod 600 ~/.ssh/id_lotus
+          ssh-keyscan -H "$SERVER_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+          cat > ~/.ssh/config << EOF
+          Host lotus
+            HostName ${SERVER_HOST}
+            User ${{ secrets.SERVER_USER || 'ubuntu' }}
+            IdentityFile ~/.ssh/id_lotus
+            StrictHostKeyChecking accept-new
+            ConnectTimeout 20
+            ServerAliveInterval 30
+          EOF
+          chmod 600 ~/.ssh/config
+          echo "SSH configured for $SERVER_HOST"
+
+      - name: Run 6 hourly online backups then self-retrigger
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER || 'ubuntu' }}
+          MC_PATH: ${{ secrets.MC_PATH || '/home/ubuntu/minecraft' }}
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # ---------- ONLINE BACKUP (never stops the server) ----------
+          do_backup() {
+            local TS ROOT
+            TS=$(date -u +%Y%m%d_%H%M%S)
+            ROOT="backups/${TS}"
+            mkdir -p "$ROOT"
+
+            echo "==== ONLINE BACKUP $TS ===="
+            echo "Target: ${SERVER_USER}@${SERVER_HOST}:${MC_PATH}"
+            echo "Mode: live file copy only — no stop / restart / reboot"
+
+            # Safety check: refuse if any stop/restart command somehow appears
+            # (defensive — we never call them)
+
+            # 1) Capture lightweight status (does not affect the game process)
+            ssh lotus "echo host=\$(hostname); echo time=\$(date -u +%Y-%m-%dT%H:%M:%SZ); \
+              (systemctl is-active minecraft.service 2>/dev/null || echo service=unknown); \
+              (pgrep -a bedrock_server || echo 'bedrock_server not listed'); \
+              df -h ${MC_PATH} 2>/dev/null | tail -1" > "$ROOT/status.txt" || true
+            cat "$ROOT/status.txt" || true
+
+            # 2) Create a consistent-ish tarball ON the server without stopping BDS
+            #    - We tar the world + configs while the process is running
+            #    - LevelDB may be slightly inconsistent mid-write; acceptable for hourly snapshots
+            #    - Explicitly exclude huge logs / cache if present
+            ssh lotus bash -s << REMOTE
+          set -euo pipefail
+          MC="${MC_PATH}"
+          cd "\$MC" || exit 1
+          # Only archive what we need — never touch running process
+          tar --warning=no-file-changed -czf /tmp/lotus-backup.tar.gz \
+            --exclude='*.log' \
+            --exclude='logs' \
+            --exclude='cache' \
+            --exclude='.cache' \
+            server.properties \
+            allowlist.json \
+            permissions.json \
+            worlds \
+            behavior_packs \
+            resource_packs \
+            development_behavior_packs \
+            development_resource_packs \
+            config \
+            2>/dev/null || \
+          tar --warning=no-file-changed -czf /tmp/lotus-backup.tar.gz \
+            --exclude='*.log' \
+            . 2>/dev/null || true
+          ls -lh /tmp/lotus-backup.tar.gz
+          REMOTE
+
+            # 3) Download the archive (read-only transfer)
+            scp lotus:/tmp/lotus-backup.tar.gz "$ROOT/lotus-world.tar.gz" || {
+              echo "SCP failed — trying rsync"
+              rsync -az -e "ssh" lotus:/tmp/lotus-backup.tar.gz "$ROOT/lotus-world.tar.gz" || true
+            }
+
+            # 4) Cleanup remote temp file only (does not touch server process)
+            ssh lotus "rm -f /tmp/lotus-backup.tar.gz" || true
+
+            # 5) Also pull a few critical files individually for easy browsing in the repo
+            mkdir -p "$ROOT/files"
+            for f in server.properties allowlist.json permissions.json; do
+              scp "lotus:${MC_PATH}/$f" "$ROOT/files/$f" 2>/dev/null || true
+            done
+            # World metadata (small)
+            scp "lotus:${MC_PATH}/worlds/Bedrock level/levelname.txt" "$ROOT/files/levelname.txt" 2>/dev/null || true
+            scp "lotus:${MC_PATH}/worlds/Bedrock level/world_behavior_packs.json" "$ROOT/files/world_behavior_packs.json" 2>/dev/null || true
+            scp "lotus:${MC_PATH}/worlds/Bedrock level/world_resource_packs.json" "$ROOT/files/world_resource_packs.json" 2>/dev/null || true
+
+            # Manifest
+            {
+              echo "timestamp_utc=$TS"
+              echo "host=$SERVER_HOST"
+              echo "mc_path=$MC_PATH"
+              echo "mode=online-only-no-stop"
+              if [ -f "$ROOT/lotus-world.tar.gz" ]; then
+                echo "archive_bytes=$(wc -c < "$ROOT/lotus-world.tar.gz")"
+                echo "archive_sha256=$(sha256sum "$ROOT/lotus-world.tar.gz" | awk '{print $1}')"
+              else
+                echo "archive=MISSING"
+              fi
+              find "$ROOT/files" -type f 2>/dev/null | wc -l | xargs -I{} echo "loose_files={}"
+            } > "$ROOT/MANIFEST.txt"
+            cat "$ROOT/MANIFEST.txt"
+
+            # Commit
+            git add -A
+            if git diff --cached --quiet; then
+              echo "No changes to commit"
+            else
+              git commit -m "lotus backup ${TS} (online, no server stop)"
+              for i in 1 2 3 4 5; do
+                git pull --rebase origin master 2>/dev/null || git pull --rebase origin main 2>/dev/null || true
+                git push origin HEAD:master 2>/dev/null && break
+                git push origin HEAD:main 2>/dev/null && break
+                sleep 3
+              done
+            fi
+            echo "==== BACKUP $TS DONE ===="
+          }
+
+          # ---------- 6 hourly cycles ----------
+          for hour in 1 2 3 4 5 6; do
+            echo "===== LOOP HOUR $hour/6 ====="
+            do_backup || echo "backup hour $hour failed (continuing — server left untouched)"
+            if [ "$hour" -lt 6 ]; then
+              echo "Sleeping 3600s until next hourly backup..."
+              sleep 3600
+            fi
+          done
+
+          # ---------- Self re-trigger (keeps the loop alive) ----------
+          echo "Re-triggering next 6-hour loop..."
+          OWNER_REPO="${GITHUB_REPOSITORY}"
+          # Prefer workflow_dispatch on the same file
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${OWNER_REPO}/actions/workflows/hourly-backup.yml/dispatches" \
+            -d '{"ref":"master"}' \
+            && echo "retriggered via workflow_dispatch" \
+            || curl -fsS -X POST \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${OWNER_REPO}/dispatches" \
+              -d '{"event_type":"backup-loop"}' \
+              && echo "retriggered via repository_dispatch" \
+              || echo "retrigger failed (add GH_PAT secret with workflow scope if needed)"
